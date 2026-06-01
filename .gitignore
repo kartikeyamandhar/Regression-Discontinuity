@@ -1,0 +1,19 @@
+# Secrets — never commit
+.env
+.env.*
+*.env
+
+# Virtual environment (recreate from requirements.txt)
+comp_env/
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# OS / editor cruft
+.DS_Store
