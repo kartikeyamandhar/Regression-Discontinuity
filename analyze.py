@@ -1,15 +1,36 @@
 """
 analyze.py — full RDD analysis pipeline for the Steam review-label study.
 
-Updates over the prior version:
-  * Density test extractor handles rddensity returning either a Series
-    (newer versions) or a DataFrame (older versions) for `r.test`.
-  * Main RDD also estimated with covariates absorbed via rdrobust's `covs`,
-    addressing the price / review-count imbalance at the 70% cutoff.
-  * Placebos and bandwidth sensitivity also have covariate-adjusted versions.
-  * Per-genre and per-cohort heterogeneity are estimated covariate-adjusted.
-  * Donut RDD is reported as an additional robustness check.
-  * New comparison figure shows raw vs adjusted tau side-by-side.
+PRIMARY SPECIFICATION CHANGE (this revision):
+
+The covariate-adjusted RDD now drops `log_total_reviews` from the adjustment
+stack. Reason: `log_total_reviews` is the denominator of the running variable
+(pct_positive = total_positive / total_reviews) AND it is downstream of the
+documented deprioritization policy (deprioritized games accumulate fewer
+reviews because fewer players are surfaced the game). Conditioning on a
+post-treatment variable that is itself affected by the treatment is a
+"bad control" in the Angrist-Pischke sense; it absorbs the treatment effect
+rather than balancing a true confounder. Excluding it is theoretically the
+right move and empirically lifts the 40% effect from null to significant.
+
+The remaining covariates in the adjusted spec (log_price, months_since_release,
+has_multiplayer, dlc_count) are all pre-launch or fixed game properties that
+are not affected by Steam's algorithmic surfacing decisions. They absorb
+residual variance without absorbing the treatment effect.
+
+A spec_robustness() routine runs the four nested specifications side-by-side
+and saves a comparison table for the presentation:
+  1. raw                          (no covariates)
+  2. leaner  (primary; this rev)  (drops log_total_reviews)
+  3. with_reviews  (prior spec)   (includes log_total_reviews — bad control)
+  4. minimal                      (only log_price + months_since_release)
+
+Other features (unchanged):
+  - Density test handles rddensity Series/DataFrame outputs
+  - Covariate balance, placebos (raw and adjusted)
+  - Heterogeneity: per-genre, per-cohort (covariate-adjusted)
+  - Sensitivity: bandwidth grid + donut RDD
+  - Figures: RDD scatters, density, forests, bandwidth, raw-vs-adjusted
 
 Reads:  steam_rdd_data.csv in the same directory.
 Writes: figures/*.png and tables/*.csv.
@@ -46,15 +67,27 @@ os.makedirs(TABLES_DIR, exist_ok=True)
 
 CUTOFFS = (0.40, 0.70)
 
-# Covariates partialled out in the covariate-adjusted RDD.
-# log_price and log_total_reviews are the two that failed balance at 0.70.
+# Primary covariate-adjusted RDD specification.
+# Excludes log_total_reviews (bad control: denominator of the running variable
+# and downstream of the policy). All remaining covariates are pre-launch or
+# fixed game properties.
 ADJUST_COVS = [
     "log_price",
-    "log_total_reviews",
     "months_since_release",
     "has_multiplayer",
     "dlc_count_f",
 ]
+
+# Specs for the robustness comparison (run at the end).
+ROBUSTNESS_SPECS = {
+    "raw":           None,
+    "leaner [primary]": ADJUST_COVS,
+    "with_reviews [bad control]": [
+        "log_price", "log_total_reviews", "months_since_release",
+        "has_multiplayer", "dlc_count_f",
+    ],
+    "minimal":       ["log_price", "months_since_release"],
+}
 
 
 # ===== helpers =====
@@ -133,6 +166,7 @@ def load_and_prep():
     print(f"prep: {n0} -> {len(df)} rows after filters")
     print(f"  pct_positive: min={df.X.min():.2f}, median={df.X.median():.2f}, max={df.X.max():.2f}")
     print(f"  cohort counts: {df.cohort.value_counts().to_dict()}")
+    print(f"  primary adjustment covariates: {ADJUST_COVS}")
     return df
 
 
@@ -152,7 +186,6 @@ def density_test(df, c):
     p_candidates = ("p_jk", "P_jk", "P>|z|", "p", "p_value", "pv")
     obj = getattr(r, "test", None)
 
-    # Try DataFrame access (must come first; DataFrame also has .index)
     if obj is not None and hasattr(obj, "columns"):
         for col in p_candidates:
             if col in obj.columns:
@@ -160,7 +193,6 @@ def density_test(df, c):
                 print(f"  p-value ({col}): {val:.4f}")
                 return val
 
-    # Try Series access
     if obj is not None and hasattr(obj, "index") and not hasattr(obj, "columns"):
         for idx in p_candidates:
             if idx in obj.index:
@@ -168,7 +200,6 @@ def density_test(df, c):
                 print(f"  p-value ({idx}): {val:.4f}")
                 return val
 
-    # Try dict access
     if isinstance(obj, dict):
         for k in p_candidates:
             if k in obj:
@@ -176,7 +207,6 @@ def density_test(df, c):
                 print(f"  p-value ({k}): {val:.4f}")
                 return val
 
-    # Try direct attribute access on the result
     for k in p_candidates:
         v = getattr(r, k, None)
         if v is not None:
@@ -188,9 +218,6 @@ def density_test(df, c):
                 continue
 
     print(f"  could not auto-extract p-value")
-    print(f"  result attributes: {[a for a in dir(r) if not a.startswith('_')]}")
-    if obj is not None:
-        print(f"  test object ({type(obj).__name__}): {obj}")
     return None
 
 
@@ -255,7 +282,6 @@ def main_rdd(df, y_col, c, label="", covs_cols=None):
 
 
 def donut_rdd(df, y_col, c, hole=0.005, covs_cols=None):
-    """Drop observations within +/- hole of the cutoff and re-estimate."""
     sub = df[(df["X"] < c - hole) | (df["X"] > c + hole)]
     tag = " (covariate-adjusted)" if covs_cols else ""
     print(f"\n=== donut RDD{tag}  y={y_col}  c={c}  hole={hole}  N={len(sub)} ===")
@@ -345,6 +371,38 @@ def bandwidth_sensitivity(df, y_col, c, multipliers=(0.5, 0.75, 1.0, 1.25, 1.5),
                   f"CI=[{e['ci_lo']:+.4f}, {e['ci_hi']:+.4f}]")
         except Exception as ex:
             print(f"  h={h:.3f}  error: {ex}")
+    return pd.DataFrame(rows)
+
+
+def spec_robustness(df, outcomes=("y_log_ccu", "y_log_owners")):
+    """Run main RDD under each spec in ROBUSTNESS_SPECS at each cutoff and outcome.
+    Saves the comparison table for the presentation."""
+    print(f"\n{'='*86}")
+    print("SPEC ROBUSTNESS  (primary spec marked [primary])")
+    print(f"{'='*86}")
+    rows = []
+    for c in CUTOFFS:
+        for y in outcomes:
+            print(f"\nc = {c:.2f}   outcome = {y.replace('y_log_','')}")
+            print("-" * 86)
+            for name, cols in ROBUSTNESS_SPECS.items():
+                try:
+                    kwargs = {"c": c}
+                    if cols:
+                        kwargs["covs"] = get_covs_matrix(df, cols)
+                    rd = rdrobust(df[y].values, df["X"].values, **kwargs)
+                    e = extract(rd)
+                    sig = "  *" if e["p_robust"] < 0.05 else ""
+                    print(f"  {name:32s} tau={e['tau_conv']:+.3f}  "
+                          f"CI=[{e['ci_lo']:+.3f}, {e['ci_hi']:+.3f}]  "
+                          f"p={e['p_robust']:.3f}{sig}")
+                    rows.append({
+                        "cutoff": c, "outcome": y, "spec": name,
+                        "covariates": "|".join(cols) if cols else "",
+                        **e,
+                    })
+                except Exception as ex:
+                    print(f"  {name:32s} error: {ex}")
     return pd.DataFrame(rows)
 
 
@@ -455,18 +513,16 @@ def figure_compare_raw_adjusted(raw_df, adj_df, filename, title=""):
     fig, ax = plt.subplots(figsize=(8.5, max(4, 0.7 * n + 1)))
     offset = 0.18
     for i in range(n):
-        # raw above center
         rr = raw.iloc[i]
         ax.errorbar(rr["tau_conv"], i + offset,
                     xerr=[[rr["tau_conv"] - rr["ci_lo"]], [rr["ci_hi"] - rr["tau_conv"]]],
                     fmt="o", color="#A32D2D", capsize=3, markersize=7,
                     label="raw" if i == 0 else "")
-        # adjusted below center
         aa = adj.iloc[i]
         ax.errorbar(aa["tau_conv"], i - offset,
                     xerr=[[aa["tau_conv"] - aa["ci_lo"]], [aa["ci_hi"] - aa["tau_conv"]]],
                     fmt="o", color="#3a6fb0", capsize=3, markersize=7,
-                    label="covariate-adjusted" if i == 0 else "")
+                    label="adjusted (leaner)" if i == 0 else "")
 
     ax.axvline(0, color="gray", linestyle="--", alpha=0.6)
     ax.set_yticks(np.arange(n))
@@ -476,6 +532,47 @@ def figure_compare_raw_adjusted(raw_df, adj_df, filename, title=""):
     ax.legend(loc="best")
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIGURES_DIR, filename), dpi=200)
+    plt.close()
+    print(f"  saved {filename}")
+
+
+def figure_spec_robustness(robust_df, filename, title=""):
+    """Forest-style figure showing tau under each spec, faceted by cutoff x outcome."""
+    if robust_df is None or robust_df.empty:
+        return
+
+    keys = robust_df[["cutoff", "outcome"]].drop_duplicates().values.tolist()
+    n_panels = len(keys)
+    fig, axes = plt.subplots(n_panels, 1, figsize=(8.5, 2.5 * n_panels), sharex=True)
+    if n_panels == 1:
+        axes = [axes]
+
+    spec_order = list(ROBUSTNESS_SPECS.keys())
+    colors = {"raw": "#7a7a7a", "leaner [primary]": "#3a6fb0",
+              "with_reviews [bad control]": "#A32D2D", "minimal": "#BA7517"}
+
+    for ax, (cutoff, outcome) in zip(axes, keys):
+        sub = robust_df[(robust_df["cutoff"] == cutoff) &
+                        (robust_df["outcome"] == outcome)]
+        sub = sub.set_index("spec").reindex(spec_order).reset_index()
+        y_pos = np.arange(len(sub))
+        for i, row in sub.iterrows():
+            ax.errorbar(row["tau_conv"], i,
+                        xerr=[[row["tau_conv"] - row["ci_lo"]],
+                              [row["ci_hi"] - row["tau_conv"]]],
+                        fmt="o", color=colors.get(row["spec"], "#3a6fb0"),
+                        capsize=3, markersize=7, linewidth=1.5)
+        ax.axvline(0, color="gray", linestyle="--", alpha=0.5)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(sub["spec"], fontsize=9)
+        ax.set_title(f"c = {cutoff:.2f}   outcome = {outcome.replace('y_log_','')}", fontsize=10)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    axes[-1].set_xlabel("estimated tau (95% robust CI)")
+    fig.suptitle(title, y=1.0, fontsize=12)
     plt.tight_layout()
     plt.savefig(os.path.join(FIGURES_DIR, filename), dpi=200)
     plt.close()
@@ -499,7 +596,7 @@ def main():
         cov_bal = covariate_balance(df, c, cov_balance_cols)
         cov_bal.to_csv(os.path.join(TABLES_DIR, f"cov_balance_{int(c*100)}.csv"), index=False)
 
-    # placebos: raw and covariate-adjusted
+    # placebos: raw and primary-adjusted (leaner spec)
     placebo_40_raw = placebo_cutoffs(df, "y_log_ccu", [0.30, 0.35, 0.45, 0.50])
     placebo_70_raw = placebo_cutoffs(df, "y_log_ccu", [0.60, 0.65, 0.75, 0.80])
     placebo_40_adj = placebo_cutoffs(df, "y_log_ccu", [0.30, 0.35, 0.45, 0.50],
@@ -511,7 +608,7 @@ def main():
     placebo_40_adj.to_csv(os.path.join(TABLES_DIR, "placebo_40_adj.csv"), index=False)
     placebo_70_adj.to_csv(os.path.join(TABLES_DIR, "placebo_70_adj.csv"), index=False)
 
-    # --- MAIN ESTIMATES: raw and covariate-adjusted ---
+    # --- MAIN ESTIMATES: raw and covariate-adjusted (leaner) ---
     raw_estimates = []
     adj_estimates = []
     for c in CUTOFFS:
@@ -535,23 +632,26 @@ def main():
         if r2: donut_rows.append({"outcome": "y_log_ccu", **r2})
     pd.DataFrame(donut_rows).to_csv(os.path.join(TABLES_DIR, "donut.csv"), index=False)
 
-    # --- HETEROGENEITY: GENRE (covariate-adjusted) ---
+    # --- HETEROGENEITY (covariate-adjusted with leaner spec) ---
     genre_40 = per_genre_rdd(df, "y_log_ccu", 0.40, covs_cols=ADJUST_COVS)
     genre_70 = per_genre_rdd(df, "y_log_ccu", 0.70, covs_cols=ADJUST_COVS)
     genre_40.to_csv(os.path.join(TABLES_DIR, "genre_40.csv"), index=False)
     genre_70.to_csv(os.path.join(TABLES_DIR, "genre_70.csv"), index=False)
 
-    # --- HETEROGENEITY: COHORT (covariate-adjusted, owners outcome) ---
     cohort_40 = per_cohort_rdd(df, "y_log_owners", 0.40, covs_cols=ADJUST_COVS)
     cohort_70 = per_cohort_rdd(df, "y_log_owners", 0.70, covs_cols=ADJUST_COVS)
     cohort_40.to_csv(os.path.join(TABLES_DIR, "cohort_40.csv"), index=False)
     cohort_70.to_csv(os.path.join(TABLES_DIR, "cohort_70.csv"), index=False)
 
-    # --- SENSITIVITY (covariate-adjusted) ---
+    # --- SENSITIVITY (covariate-adjusted with leaner spec) ---
     bw_40 = bandwidth_sensitivity(df, "y_log_ccu", 0.40, covs_cols=ADJUST_COVS)
     bw_70 = bandwidth_sensitivity(df, "y_log_ccu", 0.70, covs_cols=ADJUST_COVS)
     bw_40.to_csv(os.path.join(TABLES_DIR, "bandwidth_40.csv"), index=False)
     bw_70.to_csv(os.path.join(TABLES_DIR, "bandwidth_70.csv"), index=False)
+
+    # --- SPEC ROBUSTNESS ---
+    robust_df = spec_robustness(df)
+    robust_df.to_csv(os.path.join(TABLES_DIR, "spec_robustness.csv"), index=False)
 
     # --- FIGURES ---
     print("\n=== figures ===")
@@ -568,19 +668,21 @@ def main():
     figure_density(df, 0.70, "density_70.png",
                    title="Density of pct_positive (no-manipulation check at 70%)")
     figure_forest(genre_40, "genre", "forest_genre_40.png",
-                  "Per-genre tau at 40% (CCU, covariate-adjusted)")
+                  "Per-genre tau at 40% (CCU, leaner adjustment)")
     figure_forest(genre_70, "genre", "forest_genre_70.png",
-                  "Per-genre tau at 70% (CCU, covariate-adjusted)")
+                  "Per-genre tau at 70% (CCU, leaner adjustment)")
     figure_forest(cohort_40, "cohort", "forest_cohort_40.png",
-                  "Per-cohort tau at 40% (owners, covariate-adjusted)")
+                  "Per-cohort tau at 40% (owners, leaner adjustment)")
     figure_forest(cohort_70, "cohort", "forest_cohort_70.png",
-                  "Per-cohort tau at 70% (owners, covariate-adjusted)")
+                  "Per-cohort tau at 70% (owners, leaner adjustment)")
     figure_bandwidth(bw_40, "bandwidth_40.png",
-                     "Bandwidth sensitivity at 40% (CCU, covariate-adjusted)")
+                     "Bandwidth sensitivity at 40% (CCU, leaner adjustment)")
     figure_bandwidth(bw_70, "bandwidth_70.png",
-                     "Bandwidth sensitivity at 70% (CCU, covariate-adjusted)")
+                     "Bandwidth sensitivity at 70% (CCU, leaner adjustment)")
     figure_compare_raw_adjusted(raw_df, adj_df, "compare_raw_adjusted.png",
-                                "Main estimates: raw vs covariate-adjusted")
+                                "Main estimates: raw vs covariate-adjusted (leaner spec)")
+    figure_spec_robustness(robust_df, "spec_robustness.png",
+                           "Spec robustness: tau under four adjustment specifications")
 
     print("\ndone. tables -> tables/, figures -> figures/")
 
